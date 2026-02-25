@@ -1,0 +1,13 @@
+{
+  "name": "ai-growth-planner",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c green,cyan \"cd backend && .\\\\.venv\\\\Scripts\\\\python.exe manage.py runserver 0.0.0.0:8000\" \"cd frontend-main && npm run dev -- --host\"",
+    "dev:backend": "cd backend && .\\\\.venv\\\\Scripts\\\\python.exe manage.py runserver 0.0.0.0:8000",
+    "dev:frontend": "cd frontend-main && npm run dev -- --host"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
