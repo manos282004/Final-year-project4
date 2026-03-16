@@ -11,7 +11,13 @@ from django.db.models import Max
 import math
 import os
 import re
+from io import BytesIO
 from time import time as now_ts
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 
 
@@ -207,6 +213,12 @@ BUSINESS_TYPE_KEYWORDS = {
         "workshop",
         "maintenance",
         "garage",
+        "balancer",
+        "scanner",
+        "compressor",
+        "ramp",
+        "tyre",
+        "washer",
     ],
     "spares": [
         "spare",
@@ -487,11 +499,14 @@ def _count_businesses(area_info, business_type: str):
 
 # ---- Project Essentials (PDF-derived) ----
 
-PROJECT_ESSENTIALS_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "data", "project_essentials.txt")
-)
+PROJECT_ESSENTIALS_CANDIDATE_PATHS = [
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "project_essentials_source.txt")
+    ),
+]
 _PROJECT_ESSENTIALS_TEXT = None
 _PROJECT_ESSENTIALS_SECTIONS = None
+_PROJECT_ESSENTIALS_SOURCE = None
 
 SECTION_TITLES = {
     "showroom": r"1\.\s*Two-Wheeler Showroom\s*\(Sales\)",
@@ -506,24 +521,65 @@ SECTION_LABELS = [
     "Price Details",
 ]
 
+QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "at", "can", "centre", "center", "cost", "details",
+    "do", "for", "give", "how", "i", "in", "is", "me", "much", "need", "of",
+    "on", "price", "project", "service", "shop", "showroom", "spare", "spares",
+    "tell", "the", "this", "to", "two", "type", "types", "vehicle", "wheeler",
+    "what", "which"
+}
+
 def _load_project_essentials_text():
-    global _PROJECT_ESSENTIALS_TEXT, _PROJECT_ESSENTIALS_SECTIONS
+    global _PROJECT_ESSENTIALS_TEXT, _PROJECT_ESSENTIALS_SECTIONS, _PROJECT_ESSENTIALS_SOURCE
     if _PROJECT_ESSENTIALS_TEXT is not None and _PROJECT_ESSENTIALS_SECTIONS is not None:
         return _PROJECT_ESSENTIALS_TEXT, _PROJECT_ESSENTIALS_SECTIONS
 
     text = ""
-    if os.path.exists(PROJECT_ESSENTIALS_PATH):
-        try:
-            with open(PROJECT_ESSENTIALS_PATH, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            with open(PROJECT_ESSENTIALS_PATH, "r", encoding="utf-8-sig", errors="replace") as f:
-                text = f.read()
+    for candidate_path in PROJECT_ESSENTIALS_CANDIDATE_PATHS:
+        if not os.path.exists(candidate_path):
+            continue
+        text = _read_project_essentials_file(candidate_path)
+        if text.strip():
+            _PROJECT_ESSENTIALS_SOURCE = candidate_path
+            break
     text = _clean_project_text(text)
+    if _PROJECT_ESSENTIALS_SOURCE:
+        print(f"PROJECT_ESSENTIALS_SOURCE={_PROJECT_ESSENTIALS_SOURCE}")
 
     _PROJECT_ESSENTIALS_TEXT = text
     _PROJECT_ESSENTIALS_SECTIONS = _split_project_sections(text) if text else {}
     return _PROJECT_ESSENTIALS_TEXT, _PROJECT_ESSENTIALS_SECTIONS
+
+def _read_project_essentials_file(path: str):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ""
+
+    if raw.startswith(b"%PDF"):
+        return _extract_pdf_text(raw)
+
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+def _extract_pdf_text(raw_pdf: bytes):
+    if PdfReader is None:
+        return ""
+    try:
+        reader = PdfReader(BytesIO(raw_pdf))
+        page_text = []
+        for page in reader.pages:
+            extracted = page.extract_text() or ""
+            if extracted.strip():
+                page_text.append(extracted)
+        return "\n".join(page_text)
+    except Exception:
+        return ""
 
 def _split_project_sections(text: str):
     if not text:
@@ -543,6 +599,18 @@ def _split_project_sections(text: str):
 def _clean_project_text(text: str):
     if not text:
         return ""
+    replacements = {
+        "â€¢": "•",
+        "â‚¹": "₹",
+        "Ã¢â€šÂ¹": "₹",
+        "â€“": "-",
+        "â€”": "-",
+        "â€˜": "'",
+        "â€™": "'",
+        "\t": " ",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
     cleaned_lines = []
     for ln in text.splitlines():
         stripped = ln.strip()
@@ -557,6 +625,29 @@ def _clean_project_text(text: str):
     return "\n".join(cleaned_lines)
 
 def _extract_labeled_block(section_text: str, label: str):
+    pattern = re.compile(
+        r"^\s*[•\-\u2022]?\s*" + re.escape(label) + r"\s*:\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    match = pattern.search(section_text)
+    if not match:
+        return None
+    start = match.end()
+    next_match = None
+    for next_label in SECTION_LABELS:
+        if next_label.lower() == label.lower():
+            continue
+        nm = re.search(
+            r"^\s*[•\-\u2022]?\s*" + re.escape(next_label) + r"\s*:\s*$",
+            section_text[start:],
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if nm:
+            absolute = start + nm.start()
+            if next_match is None or absolute < next_match:
+                next_match = absolute
+    end = next_match if next_match is not None else len(section_text)
+    return section_text[match.start():end].strip()
     pattern = re.compile(
         r"^\s*[•\-\u2022]?\s*" + re.escape(label) + r"\s*:\s*$",
         re.IGNORECASE | re.MULTILINE,
@@ -612,6 +703,172 @@ def _project_context_for(business_type: str, message: str):
     if len(context) > max_chars:
         context = context[:max_chars].rsplit("\n", 1)[0].strip()
     return context
+
+def _is_price_query(message: str) -> bool:
+    t = (message or "").lower()
+    return any(word in t for word in ["price", "cost", "rate", "amount"])
+
+def _looks_like_price_line(line: str) -> bool:
+    return bool(
+        re.search(
+            r"(₹|inr|lakh|\b\d{1,3}(?:,\d{3})+\b|\b\d+\s*each\b)",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+    return bool(
+        re.search(
+            r"(₹|â‚¹|inr|lakh|\b\d{1,3}(?:,\d{3})+\b|\b\d+\s*each\b)",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+def _normalize_query_tokens(text: str):
+    normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    tokens = []
+    for token in normalized.split():
+        if token in QUERY_STOPWORDS:
+            continue
+        if token.endswith("s") and len(token) > 3:
+            token = token[:-1]
+        tokens.append(token)
+    return tokens
+
+def _clean_response_line(line: str):
+    line = (line or "").strip()
+    line = re.sub(r"^[•\-\u2022]+\s*", "", line)
+    line = re.sub(r"^o\s+", "", line)
+    return line.strip()
+    line = (line or "").strip()
+    line = re.sub(r"^[â€¢•\-\u2022]\s*", "", line)
+    line = re.sub(r"^o\s+", "", line)
+    return line.strip()
+
+def _strict_section_response(business_type: str, message: str):
+    text, sections = _load_project_essentials_text()
+    if not text:
+        return None
+
+    section_text = sections.get(business_type, text)
+    t = (message or "").lower()
+    labels = []
+    if any(k in t for k in ["equipment", "tool", "machinery", "setup", "infrastructure", "machine"]):
+        labels.append("Equipment Needed")
+    if any(k in t for k in ["document", "license", "licence", "permit", "registration"]):
+        labels.append("Documents Needed")
+    if any(k in t for k in ["procedure", "process", "steps", "how to", "apply"]):
+        labels.append("Procedure")
+
+    if not labels:
+        return None
+
+    blocks = []
+    for label in labels:
+        block = _extract_labeled_block(section_text, label)
+        if not block:
+            continue
+        lines = []
+        for raw_line in block.splitlines():
+            line = _clean_response_line(raw_line)
+            if line:
+                lines.append(f"- {line}")
+        if lines:
+            blocks.append("\n".join(lines[:12]))
+    return "\n\n".join(blocks) if blocks else None
+
+def _strict_line_response(business_type: str, message: str):
+    text, sections = _load_project_essentials_text()
+    if not text:
+        return None
+
+    section_text = sections.get(business_type, text)
+    keywords = set(_normalize_query_tokens(message))
+    if not keywords:
+        return None
+
+    candidates = []
+    for raw_line in section_text.splitlines():
+        line = _clean_response_line(raw_line)
+        if not line or len(line) < 3:
+            continue
+        line_tokens = set(_normalize_query_tokens(line))
+        overlap = keywords & line_tokens
+        if not overlap:
+            continue
+        score = len(overlap)
+        if all(token in line_tokens for token in keywords):
+            score += 5
+        candidates.append((score, len(line), line))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_score = candidates[0][0]
+    best_lines = [line for score, _, line in candidates if score == best_score][:5]
+    return "\n".join(f"- {line}" for line in best_lines)
+
+def _strict_source_response(business_type: str, message: str):
+    price_reply = _strict_price_response(business_type, message)
+    if price_reply:
+        return price_reply
+
+    section_reply = _strict_section_response(business_type, message)
+    if section_reply:
+        return section_reply
+
+    line_reply = _strict_line_response(business_type, message)
+    if line_reply:
+        return line_reply
+
+    return None
+
+def _strict_price_response(business_type: str, message: str):
+    if not _is_price_query(message):
+        return None
+
+    text, sections = _load_project_essentials_text()
+    if not text:
+        return None
+
+    keywords = set(_normalize_query_tokens(message))
+    if not keywords:
+        return None
+
+    message_lower = (message or "").lower()
+    requested_type = _infer_business_type(message, business_type)
+    candidates = []
+    for section_key, section_text in sections.items():
+        price_block = _extract_labeled_block(section_text, "Price Details") or section_text
+        for raw_line in price_block.splitlines():
+            line = _clean_response_line(raw_line)
+            if not line:
+                continue
+            if not _looks_like_price_line(line):
+                continue
+
+            line_tokens = set(_normalize_query_tokens(line))
+            overlap = keywords & line_tokens
+            if not overlap:
+                continue
+
+            score = len(overlap)
+            if all(token in line_tokens for token in keywords):
+                score += 5
+            if section_key == requested_type:
+                score += 3
+            elif any(keyword in message_lower for keyword in BUSINESS_TYPE_KEYWORDS.get(section_key, [])):
+                score += 2
+            candidates.append((score, len(line), line, section_key))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    best_score = candidates[0][0]
+    best_lines = [line for score, _, line, _ in candidates if score == best_score][:3]
+    return "\n".join(f"- {line}" for line in best_lines)
 
 def _fallback_from_context(context: str):
     if not context:
@@ -972,6 +1229,40 @@ def chatbot(request):
             "locations": []
         })
 
+    greeting_reply = (
+        "I'm your local business growth advisor for two-wheeler businesses in Saidapet, Chennai.\n"
+        "How can I help you today?"
+    )
+    if _is_greeting_only(message):
+        ChatMessage.objects.create(
+            session_id=session_id,
+            business_type=target_type,
+            role="assistant",
+            content=greeting_reply,
+            locations=[]
+        )
+        return Response({
+            "content": greeting_reply,
+            "sessionId": session_id,
+            "locations": []
+        })
+
+    exact_price_reply = _strict_price_response(target_type, message)
+    if exact_price_reply:
+        print(f"STRICT_PRICE_MATCH business_type={target_type} message={message!r} reply={exact_price_reply!r}")
+        ChatMessage.objects.create(
+            session_id=session_id,
+            business_type=target_type,
+            role="assistant",
+            content=exact_price_reply,
+            locations=[]
+        )
+        return Response({
+            "content": exact_price_reply,
+            "sessionId": session_id,
+            "locations": []
+        })
+
     # Select business-specific prompt
     if target_type == "showroom":
         system_prompt = SHOWROOM_PROMPT
@@ -983,11 +1274,6 @@ def chatbot(request):
         system_prompt = DEFAULT_PROMPT
 
     pdf_context = _project_context_for(target_type, message)
-    greeting_reply = (
-        "I'm your local business growth advisor for two-wheeler businesses in Saidapet, Chennai.\n"
-        "How can I help you today?"
-    )
-
     final_prompt = f"""
 {system_prompt}
 
@@ -1020,10 +1306,11 @@ RESPONSE STYLE:
 - No explanations unless asked
 - No generic advice
 
-CONTEXT FROM PROJECT ESSENTIALS (USE ONLY THIS CONTENT):
+CONTEXT FROM PROJECT ESSENTIALS (USE THIS FIRST WHEN RELEVANT):
 {pdf_context}
 
-If the context does not contain the answer, say you don't have that information and ask a clarifying question.
+If the user asks about an item, document, tool, part, or price covered in the context, stay consistent with the context.
+If the context does not cover the question, answer normally as a helpful business assistant.
 
 User question:
 {message}
@@ -1050,20 +1337,6 @@ User question:
     }
 
     try:
-        if _is_greeting_only(message):
-            ChatMessage.objects.create(
-                session_id=session_id,
-                business_type=target_type,
-                role="assistant",
-                content=greeting_reply,
-                locations=[]
-            )
-            return Response({
-                "content": greeting_reply,
-                "sessionId": session_id,
-                "locations": []
-            })
-
         if not _ollama_ready():
             fallback_text = _fallback_from_context(pdf_context)
             if fallback_text:
